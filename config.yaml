@@ -1,0 +1,59 @@
+# Non-secret configuration. Secrets live in .env (see .env.example).
+
+strategy_id: RSPS-1
+
+# The only place TradingView vocabulary meets Hyperliquid vocabulary.
+# TV symbol (as sent in the webhook payload) -> Hyperliquid perp coin.
+# null means "cash": no position, hold USDC margin.
+symbol_map:
+  BTCUSD:  BTC
+  ETHUSD:  ETH
+  SOLUSD:  SOL
+  XRPUSD:  XRP
+  BNBUSD:  BNB
+  DOGEUSD: DOGE
+  GOLD:    PAXG      # trend-managed gold sleeve -> PAXG-USD perp
+  USD:     null      # cash
+
+# Targets apply to account_equity * deploy_fraction. The ~2% buffer absorbs
+# fees/funding and keeps 1x cross positions away from 100% margin utilization.
+deploy_fraction: 0.98
+
+# Trade a per-coin delta only when |delta| > max(threshold_pct * equity, threshold_usd).
+rebalance_threshold_pct: 0.02
+rebalance_threshold_usd: 15.0
+
+# Hyperliquid's minimum order notional.
+min_order_usd: 10.0
+
+# IOC slippage cap from mid (0.005 = 0.5%).
+slippage: 0.005
+
+# Per-leg IOC retry attempts within a single reconcile run.
+leg_retries: 3
+
+# Payload validation.
+max_legs: 4
+weight_sum_tolerance: 0.001
+
+# Reconciler safety-net tick.
+reconcile_interval_seconds: 900
+
+# Watchdog thresholds.
+heartbeat_stale_hours: 13        # no heartbeat for this long -> CRITICAL
+critical_repeat_hours: 6         # unresolved CRITICALs repeat at this interval
+equity_drop_pause_pct: 0.10      # >10% equity drop between runs -> pause
+
+# TradingView Essential-plan alert expiry (~60 days).
+armed_warn_day: 53               # first reminder
+armed_nag_day: 57                # daily reminders from here
+armed_expiry_day: 60
+
+# Daily Telegram summary time (UTC, HH:MM).
+daily_summary_utc: "09:00"
+
+# healthchecks.io dead-man ping interval.
+deadman_ping_seconds: 300
+
+# Storage.
+db_path: data/rsps.db

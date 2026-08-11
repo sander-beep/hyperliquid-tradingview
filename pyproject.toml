@@ -1,0 +1,9 @@
+[project]
+name = "rsps-bot"
+version = "1.0.0"
+description = "TradingView RSPS -> Hyperliquid portfolio automation"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

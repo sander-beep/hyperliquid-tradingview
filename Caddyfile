@@ -1,0 +1,26 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	# TradingView's published webhook egress IPs (re-verify occasionally at
+	# https://www.tradingview.com/support/solutions/43000529348).
+	@tv {
+		path /webhook/*
+		remote_ip 52.89.214.238 34.212.75.30 54.218.53.128 52.32.178.7
+	}
+	@webhook_other path /webhook/*
+
+	handle @tv {
+		reverse_proxy app:8000
+	}
+	handle @webhook_other {
+		respond 403
+	}
+	handle /healthz {
+		reverse_proxy app:8000
+	}
+	handle {
+		respond 404
+	}
+}

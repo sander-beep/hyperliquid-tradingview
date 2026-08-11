@@ -1,0 +1,945 @@
+//@version=6
+import TradingView/ta/9
+indicator("Personal RSPS 1", "RSPS", max_bars_back = 5000)
+
+// ╔════════════════════════════╗
+// ║          FUNCTIONS         ║
+// ╚════════════════════════════╝
+//{
+
+// Fuction to remove parts of the ticker
+f_remove_exchange_name(string name) =>
+    string[] parts      = str.split(name, ":")
+    string result       = array.size(parts) > 1 ? array.get(parts, 1) : name
+    result
+
+// Function to get color based on the value of the signal
+f_trend_col(series int x) =>
+    x > 0 ? color.green : color.red
+
+// Gaussian filter (source weighted by a Gaussian kernel) - used by the UNISTRAT Gaussian VIDYA
+f_gaussian_filter(series float src, simple int length, simple float sigma) =>
+    gaussian_sum          = 0.0
+    gaussian_weighted_sum = 0.0
+    for i = 0 to length - 1 by 1
+        weight                = math.exp(-0.5 * math.pow((i - (length - 1) / 2) / sigma, 2))
+        gaussian_sum          += weight
+        gaussian_weighted_sum += src[i] * weight
+    gaussian_weighted_sum / gaussian_sum
+
+// For-loop scoring of a moving average (counts how often the current value is above past values) - used by the UNISTRAT VIDYA Loop
+f_loop(simple int a, simple int b, series float ma) =>
+    sum2 = 0.0
+    for i = a to b by 1
+        sum2 += (ma > ma[i] ? 1 : -1)
+    sum2
+
+// Function to return opposite of the signal
+f_oppose(series int x) =>
+    x == 1 ? (0) : (x == 0 ? 1 : 0)
+
+// Function to calculate the age of the ticker
+f_age() =>
+    // Calculate number of bars since the beginning of the chart
+    bars = bar_index + 1
+    // Limit the age to 5000 if it exceeds
+    math.min(bars, 5000)
+
+// Function to return the daily return as decimal number
+f_roc() =>
+    roc = ta.roc(close, 1)
+    r   = roc/100
+
+// Function to find the strongest, second-strongest AND third-strongest tickers among 7
+// (ticker, value) pairs. Returns [best, second, third]. All are derived from the same
+// ranking so they stay consistent.
+// TIE-BREAK: when two entities have the same score, the winner is decided by their DIRECT
+// pairwise UNISTRAT classification (pw.get(i, j) == 1 means entity i beats entity j in the
+// i/j ratio), so results don't depend on the order the tickers are entered in.
+f_TopThreeAssets(simple string ticker1, series int v1, simple string ticker2, series int v2, simple string ticker3, series int v3, 
+ simple string ticker4, series int v4, simple string ticker5, series int v5, simple string ticker6, series int v6, simple string ticker7, series int v7, matrix<int> pw) =>
+    // Create arrays for tickers and values
+    var array<string> tickers = array.new_string(7, "")
+    var array<float> values   = array.new_float(7, 0.0)
+    
+    array.set(tickers, 0, ticker1), array.set(values, 0, v1)
+    array.set(tickers, 1, ticker2), array.set(values, 1, v2)
+    array.set(tickers, 2, ticker3), array.set(values, 2, v3)
+    array.set(tickers, 3, ticker4), array.set(values, 3, v4)
+    array.set(tickers, 4, ticker5), array.set(values, 4, v5)
+    array.set(tickers, 5, ticker6), array.set(values, 5, v6)
+    array.set(tickers, 6, ticker7), array.set(values, 6, v7)
+    
+    // Index of the highest value; on ties, the challenger takes the lead only if it beats
+    // the current leader in their direct pairwise ratio classification
+    int bestIndex = 0
+    for i = 1 to 6
+        float v_i = array.get(values, i)
+        float v_b = array.get(values, bestIndex)
+        if v_i > v_b or (v_i == v_b and matrix.get(pw, i, bestIndex) == 1)
+            bestIndex := i
+
+    // Index of the highest value among the remaining (the second-strongest), same tie-break
+    int secondIndex = bestIndex == 0 ? 1 : 0
+    for i = 0 to 6
+        if i != bestIndex
+            float v_i = array.get(values, i)
+            float v_s = array.get(values, secondIndex)
+            if v_i > v_s or (v_i == v_s and matrix.get(pw, i, secondIndex) == 1)
+                secondIndex := i
+
+    // Index of the highest value among the rest (the third-strongest), same tie-break.
+    // Seed with the lowest index not already taken by best/second.
+    int thirdIndex = bestIndex != 0 and secondIndex != 0 ? 0 : bestIndex != 1 and secondIndex != 1 ? 1 : 2
+    for i = 0 to 6
+        if i != bestIndex and i != secondIndex
+            float v_i = array.get(values, i)
+            float v_t = array.get(values, thirdIndex)
+            if v_i > v_t or (v_i == v_t and matrix.get(pw, i, thirdIndex) == 1)
+                thirdIndex := i
+
+    [array.get(tickers, bestIndex), array.get(tickers, secondIndex), array.get(tickers, thirdIndex)]
+
+// Function to calculate strategy equity, with maximum drawdown.
+// Allocation is driven by the weights: (1,0,0) -> 100% strongest; (0.8,0.2,0) -> 80/20
+// strongest/second; (0.6,0.3,0.1) -> 60/30/10 across the top three. Blends are rebalanced
+// every bar, so the bar's portfolio return is the weighted sum of the legs' returns
+// (decided on the prior close via the [1] index, as before).
+f_equity(simple string ticker1, simple string ticker2, simple string ticker3, simple string ticker4, simple string ticker5, simple string ticker6,  
+ series string best_asset, series string second_asset, series string third_asset, series float r1, series float r2, series float r3, series float r4, series float r5, series float r6, 
+ series bool backtest, simple float w1, simple float w2, simple float w3, series bool btc_ok, series float cash_ret) =>
+
+    var float equity        = na
+    var float peak_equity   = na
+    var float max_drawdown  = 0.0
+
+    if backtest
+        // "USD" legs earn the cash-sleeve return: 0 normally, or trend-managed gold's
+        // return when the gold-while-in-cash option is enabled and gold's weekly trend is long.
+        a_best = switch best_asset[1]
+            ticker1 => r1
+            ticker2 => r2
+            ticker3 => r3
+            ticker4 => r4
+            ticker5 => r5
+            ticker6 => r6
+            "USD"   => cash_ret
+
+        a_second = switch second_asset[1]
+            ticker1 => r1
+            ticker2 => r2
+            ticker3 => r3
+            ticker4 => r4
+            ticker5 => r5
+            ticker6 => r6
+            "USD"   => cash_ret
+
+        a_third = switch third_asset[1]
+            ticker1 => r1
+            ticker2 => r2
+            ticker3 => r3
+            ticker4 => r4
+            ticker5 => r5
+            ticker6 => r6
+            "USD"   => cash_ret
+
+        // When USD is the strongest asset the system is fully risk-off, so we hold 100%
+        // cash (the cash sleeve) regardless of mode (no extra legs into weaker assets).
+        best_is_usd = best_asset[1] == "USD"
+        // Market-regime filter: only take a position while BTC is in an uptrend (per the BTC
+        // filters), else hold cash. Evaluated on the prior bar ([1]) to match best_asset[1] timing.
+        btc_allows  = btc_ok[1]
+        // Blended (rebalanced) return for the bar (cash sleeve when a BTC filter blocks)
+        a = not btc_allows ? cash_ret :
+             best_is_usd ? a_best :
+             w2 == 0.0 and w3 == 0.0 ? a_best :
+             w3 == 0.0 ? w1 * a_best + w2 * a_second :
+             w1 * a_best + w2 * a_second + w3 * a_third
+
+        equity              := na(equity[1]) ? 1 : equity[1] * (1 + a)
+
+        // Calculate max drawdown
+        peak_equity         := math.max(na(peak_equity) ? equity : peak_equity, equity)
+        current_drawdown    = peak_equity > 0 ? (peak_equity - equity) / peak_equity : 0
+        if current_drawdown > max_drawdown
+            max_drawdown    := current_drawdown
+        if equity > peak_equity
+            peak_equity     := equity
+    else
+        equity              := 1
+
+    [equity, math.round(max_drawdown, 4)]
+
+// Function to calculate buy and hold equity of an asset, with maximum drawdown
+f_buy_and_hold(series float r, series bool backtest) =>
+
+    var float equity        = na
+    var float peak_equity   = na
+    var float max_drawdown  = 0.0
+    
+    if backtest
+        // Calculate equity
+        equity              := na(equity[1]) ? 1 : equity[1] * (1 + r)
+        
+        // Calculate max drawdown
+        peak_equity         := math.max(na(peak_equity) ? equity : peak_equity, equity)
+        current_drawdown    = peak_equity > 0 ? (peak_equity - equity) / peak_equity : 0
+        if current_drawdown > max_drawdown
+            max_drawdown    := current_drawdown
+        if equity > peak_equity
+            peak_equity     := equity
+    else
+        equity              := 1
+
+    [equity, math.round(max_drawdown, 4)]
+
+// Function to calculate the "filtered" equity, with maximum drawdown. It compounds the
+// unfiltered strategy equity's return ONLY while that equity is itself in a positive
+// UNISTRAT trend (eq_signal > 0); otherwise it sits flat (in cash). eq_signal is the
+// UNISTRAT long signal computed on the unfiltered equity curve, and it is referenced
+// with a one-bar lag so the in/out decision is made on the prior close (no look-ahead).
+f_filtered_equity(series float base_equity, series int eq_signal, series bool backtest, series float cash_ret) =>
+
+    var float equity        = na
+    var float peak_equity   = na
+    var float max_drawdown  = 0.0
+
+    if backtest
+        // Invested only if the equity was trending up as of the previous bar
+        invested            = eq_signal[1] > 0
+        // The unfiltered equity's bar return = the return of the asset held this bar
+        eq_ret              = nz(base_equity / base_equity[1] - 1, 0)
+        // While filtered out, the book sits in the cash sleeve (0, or trend-managed gold)
+        a                   = invested ? eq_ret : cash_ret
+
+        equity              := na(equity[1]) ? 1 : equity[1] * (1 + a)
+
+        // Calculate max drawdown
+        peak_equity         := math.max(na(peak_equity) ? equity : peak_equity, equity)
+        current_drawdown    = peak_equity > 0 ? (peak_equity - equity) / peak_equity : 0
+        if current_drawdown > max_drawdown
+            max_drawdown    := current_drawdown
+        if equity > peak_equity
+            peak_equity     := equity
+    else
+        equity              := 1
+
+    [equity, math.round(max_drawdown, 4)]
+
+// Function to return color for equity curve for visualizing the best performing asset
+f_best_asset_col(simple string ticker1, simple string ticker2, simple string ticker3, simple string ticker4, 
+ simple string ticker5, simple string ticker6, series string best_asset, series bool backtest, color[] colors) =>
+
+    if backtest 
+        col = switch best_asset[1]
+            ticker1 => array.get(colors, 0)
+            ticker2 => array.get(colors, 1)
+            ticker3 => array.get(colors, 2)
+            ticker4 => array.get(colors, 3)
+            ticker5 => array.get(colors, 4)
+            ticker6 => array.get(colors, 5)
+            "USD"   => array.get(colors, 6)
+    else
+        col = color.new(color.white, 100)
+
+// Function to calculate performance metrics from equity curve ("base" - is the equity curve)
+f_PerformanceMetrics(series float base, series int Lookback, series bool backtest, series float max_drawdown) =>
+    // Initialize variables for positive and negative returns
+    pos_sum                     = 0.0
+    neg_sum                     = 0.0
+    pos_count                   = 0
+    neg_count                   = 0
+    returns_sum                 = 0.0
+    returns_squared_sum         = 0.0
+    pos_returns_squared_sum     = 0.0
+    neg_returns_squared_sum     = 0.0
+
+    lookback                    = Lookback
+
+    if Lookback > 4999
+        lookback := 4998
+
+    // Loop through the past 'Lookback' bars to calculate sums, counts, and drawdown
+    if backtest
+        for i = 0 to lookback - 1
+            r = (base[i] - base[i + 1]) / base[i + 1]
+            returns_sum += r
+            returns_squared_sum += r * r
+
+            if r > 0
+                pos_sum   += r
+                pos_count += 1
+                pos_returns_squared_sum += r * r
+
+            else if r < 0
+                neg_sum   += r
+                neg_count += 1
+                neg_returns_squared_sum += r * r
+    
+    float[] export_array = array.new_float(10)
+
+    // Calculate means
+    mean_all        = math.round(returns_sum / lookback, 4)
+    mean_pos        = pos_count != 0 ? math.round(pos_sum / pos_count, 4) : na
+    mean_neg        = neg_count != 0 ? math.round(neg_sum / neg_count, 4) : na
+
+    // Calculate standard deviations
+    stddev_all      = math.round(math.sqrt((returns_squared_sum - (returns_sum * returns_sum) / lookback) / lookback), 4)
+    stddev_pos      = pos_count != 0 ? math.round(math.sqrt((pos_returns_squared_sum - (pos_sum * pos_sum) / pos_count) / pos_count), 4) : na
+    stddev_neg      = neg_count != 0 ? math.round(math.sqrt((neg_returns_squared_sum - (neg_sum * neg_sum) / neg_count) / neg_count), 4) : na
+
+    // Calculate ratios. Annualization is derived from the actual chart timeframe assuming a
+    // 24/7 market (365 days): bars per year = seconds per year / seconds per bar. On a 12h
+    // chart this is sqrt(730) - the old hardcoded sqrt(255) understated Sharpe/Sortino by ~40%.
+    annualization   = math.sqrt(31536000.0 / timeframe.in_seconds(timeframe.period))
+    sharpe_ratio    = math.round((mean_all / stddev_all) * annualization, 3)
+    sortino_ratio   = math.round((mean_all / stddev_neg) * annualization, 3)
+    omega_ratio     = math.round(pos_sum / math.abs(neg_sum), 3)
+
+    // Set values in the array
+    array.set(export_array, 0, mean_all     * 100)
+    array.set(export_array, 1, mean_pos     * 100)
+    array.set(export_array, 2, mean_neg     * 100)
+    array.set(export_array, 3, stddev_all   * 100)
+    array.set(export_array, 4, stddev_pos   * 100)
+    array.set(export_array, 5, stddev_neg   * 100)
+    array.set(export_array, 6, sharpe_ratio)
+    array.set(export_array, 7, sortino_ratio)
+    array.set(export_array, 8, omega_ratio)
+    array.set(export_array, 9, max_drawdown * 100)
+
+    // Export the array
+    export_array
+
+// Function to plot Perfomance Metrics Table
+f_PerfMetricTable(simple int num_assets, simple string ticker1, simple string ticker2, simple string ticker3, simple string ticker4, simple string ticker5, simple string ticker6, 
+ float[] strategy, float[] a1, float[] a2, float[] a3, float[] a4, float[] a5, float[] a6, color[] colors) =>
+
+    var table p = table.new(position.top_left, num_assets + 2, 15, border_width = 1, frame_width = 1, frame_color = color.white)
+
+    // Header (merged across all used columns: labels + Strategy + the included assets)
+    table.cell(p, 0, 0, "Performance Metrics", text_color = color.white, bgcolor = color.gray)
+    table.merge_cells(p, 0, 0, num_assets + 1, 0)
+
+    // Column headers (only the included assets)
+    table.cell(p, 1, 1, "Strategy", text_color = array.get(colors, 7))
+    if num_assets >= 1
+        table.cell(p, 2, 1, str.tostring(f_remove_exchange_name(ticker1)), text_color = array.get(colors, 0))
+    if num_assets >= 2
+        table.cell(p, 3, 1, str.tostring(f_remove_exchange_name(ticker2)), text_color = array.get(colors, 1))
+    if num_assets >= 3
+        table.cell(p, 4, 1, str.tostring(f_remove_exchange_name(ticker3)), text_color = array.get(colors, 2))
+    if num_assets >= 4
+        table.cell(p, 5, 1, str.tostring(f_remove_exchange_name(ticker4)), text_color = array.get(colors, 3))
+    if num_assets >= 5
+        table.cell(p, 6, 1, str.tostring(f_remove_exchange_name(ticker5)), text_color = array.get(colors, 4))
+    if num_assets >= 6
+        table.cell(p, 7, 1, str.tostring(f_remove_exchange_name(ticker6)), text_color = array.get(colors, 5))
+
+    // Metrics labels
+    for i = 0 to array.size(strategy) - 1
+
+        metric = switch i
+            0  => "Mean (All Returns) %"
+            1  => "Mean (Positive Returns) %"
+            2  => "Mean (Negative Returns) %"
+            3  => "STDEV (All Returns) %"
+            4  => "STDEV (Positive Returns) %"
+            5  => "STDEV (Negative Returns) %"
+            6  => "Sharpe Ratio"
+            7 => "Sortino Ratio"
+            8 => "Omega Ratio"
+            9 => "Maximum Drawdown %"
+
+        table.cell(p, 0, i + 2, metric,                                 text_color = array.get(colors, 7))
+        table.cell(p, 1, i + 2, str.tostring(array.get(strategy, i)),   text_color = array.get(colors, 7))
+        if num_assets >= 1
+            table.cell(p, 2, i + 2, str.tostring(array.get(a1, i)),     text_color = array.get(colors, 0))
+        if num_assets >= 2
+            table.cell(p, 3, i + 2, str.tostring(array.get(a2, i)),     text_color = array.get(colors, 1))
+        if num_assets >= 3
+            table.cell(p, 4, i + 2, str.tostring(array.get(a3, i)),     text_color = array.get(colors, 2))
+        if num_assets >= 4
+            table.cell(p, 5, i + 2, str.tostring(array.get(a4, i)),     text_color = array.get(colors, 3))
+        if num_assets >= 5
+            table.cell(p, 6, i + 2, str.tostring(array.get(a5, i)),     text_color = array.get(colors, 4))
+        if num_assets >= 6
+            table.cell(p, 7, i + 2, str.tostring(array.get(a6, i)),     text_color = array.get(colors, 5))
+    p
+
+// Function to return "lookaback" period as count of bars from certain event
+f_since(series bool active) =>
+    var count = 0
+    if active
+        count += 1
+    output = count > 2 ? count - 1 : count
+    output
+//}
+
+// ╔════════════════════════════╗
+// ║           STRINGS          ║
+// ╚════════════════════════════╝
+//{
+var string tic                      = "Tickers"
+var string GS                       = "General Settings"
+var string CS                       = "Color Settings"
+var string UG                       = "UNISTRAT - Gaussian Filter"
+var string UV                       = "UNISTRAT - VIDYA ATR"
+var string UD                       = "UNISTRAT - DEMA ATR"
+var string UL                       = "UNISTRAT - VIDYA Loop"
+var string UM                       = "UNISTRAT - Median SD"
+//}
+
+// ╔════════════════════════════╗
+// ║           INPUTS           ║
+// ╚════════════════════════════╝
+//{
+
+// Tickers
+simple string ticker1               = input.symbol("CRYPTO:DOGEUSD",      "Asset 1", group = tic, display = display.none)
+simple string ticker2               = input.symbol("CRYPTO:SOLUSD",      "Asset 2", group = tic, display = display.none)
+simple string ticker3               = input.symbol("CRYPTO:XRPUSD",     "Asset 3", group = tic, display = display.none)
+simple string ticker4               = input.symbol("CRYPTO:BNBUSD",     "Asset 4", group = tic, display = display.none)
+simple string ticker5               = input.symbol("INDEX:ETHUSD",     "Asset 5", group = tic, display = display.none)
+simple string ticker6               = input.symbol("INDEX:BTCUSD",    "Asset 6", group = tic, display = display.none)
+
+// General Settings
+series float  unistrat_src          = input.source(close, "Trend Classification Source",          group = GS, display = display.none)
+simple int    num_assets            = input.int(6, "Number of Assets", minval = 2, maxval = 6, group = GS, tooltip = "How many of the asset slots to include in the rotation (Assets 1..N). Slots beyond N are ignored everywhere - scoring, ranking, equity, tables and plots - and USD is always available as the cash option.")
+simple string alloc_mode            = input.string("100% Strongest Asset", "Allocation Mode", options = ["100% Strongest Asset", "80% Strongest + 20% Second", "60% / 30% / 10% Top Three"], group = GS, tooltip = "How aggressively to allocate. '100% Strongest Asset' holds the single highest-scoring asset. '80% Strongest + 20% Second' splits the book 80/20 between the strongest and the second-strongest asset. '60% / 30% / 10% Top Three' spreads risk across the three highest-scoring assets. Blended modes are rebalanced every bar. The equity, drawdown and metrics are computed from whichever mode is selected.")
+simple bool   use_equity_filter     = input.bool(true, "Filter Equity (follow only in equity uptrend)", group = GS, tooltip = "When enabled, the UNISTRAT TPI is also run on the strategy's own equity curve. The strategy is only invested while the equity is in a positive trend; otherwise it sits in cash. This produces a 'filtered' equity curve which then drives the position, bar color and alert. When disabled, the unfiltered equity is followed (always invested).")
+simple bool   use_btc_filter_chart  = input.bool(true, "Only Long if BTC is Up (Chart TF)", group = GS, tooltip = "Market-regime filter on the chart's own timeframe. When enabled, the strategy only takes positions while INDEX:BTCUSD is in a positive UNISTRAT trend on the chart timeframe; otherwise it holds 100% cash (USD).")
+simple bool   use_btc_filter_tf     = input.bool(true, "Only Long if BTC is Up (Custom TF)", group = GS, tooltip = "Market-regime filter on the custom timeframe set below. When enabled, the strategy only takes positions while INDEX:BTCUSD is in a positive UNISTRAT trend on that timeframe; otherwise it holds 100% cash (USD).")
+simple string btc_filter_tf         = input.timeframe("W", "BTC Filter Timeframe (Custom TF)", group = GS, tooltip = "Timeframe used by the 'Custom TF' BTC filter above (e.g. 1D for a daily regime filter).")
+simple bool   use_gold_cash         = input.bool(true, "Trend-Managed Gold While in Cash", group = GS, tooltip = "When enabled, any time the strategy would sit in cash (USD strongest, a BTC filter blocking, or the equity filter out), it instead holds gold - but only while gold is in a positive UNISTRAT trend on the timeframe set below. When gold's trend is short, the cash sleeve stays in USD. The equity, metrics, position label and alert all reflect this.")
+simple string gold_tf               = input.timeframe("1D", "Gold Trend Timeframe", group = GS, tooltip = "Timeframe on which gold's UNISTRAT trend is evaluated for the cash sleeve (e.g. W for weekly, D for daily).")
+simple string gold_feed             = input.string("XAUT (24/7)", "Gold Feed", options = ["Traditional Gold", "XAUT (24/7)"], group = GS, tooltip = "Which gold market to use for both the 1W trend signal and the returns. 'Traditional Gold' (spot XAU) has long history - best for backtests. 'XAUT (24/7)' is the tokenized gold you'd actually trade; it prints around the clock so signals and returns update on every bar, including weekends.")
+simple string gold_ticker_trad      = input.symbol("TVC:GOLD",   "Traditional Gold Symbol", group = GS, display = display.none)
+simple string gold_ticker_xaut      = input.symbol("CRYPTO:XAUTUSD", "XAUT Symbol",             group = GS, display = display.none)
+simple string gold_ticker           = gold_feed == "XAUT (24/7)" ? gold_ticker_xaut : gold_ticker_trad
+simple bool   use_custom_startdate  = input.bool(true, "Use Custom Starting Date for Backtest",    group = GS, inline = "CC")
+simple float  custom_startdate      = input.time(timestamp("2023-1-1"), "",                         group = GS, inline = "CC", display = display.none)
+simple int    warmup_bars           = input.int(200, "Signal Warm-up (bars)", minval = 2, group = GS, tooltip = "Number of bars each included asset must have before the backtest starts. The UNISTRAT sub-models carry recursive state and the loop model looks back 60 bars, so early signals are unconditioned noise - this gate keeps them out of the equity. Note the weekly BTC/gold signals additionally need ~60 CLOSED weekly bars to mature; ensure the chart loads enough history before your backtest window.")
+simple bool   plot_metric_table     = input.bool(false, "Plot Perf. Metrics Table",                  group = GS)
+simple bool   show_asset_equities   = input.bool(false, "Show Asset (Buy & Hold) Equities",          group = GS)
+simple bool   show_trend_matrix     = input.bool(true, "Show Asset Trend Matrix",                    group = GS)
+
+// Color Settings
+simple color  asset1_col            = input.color(color.aqua,   "Asset 1",              group = CS, inline = "C1")
+simple color  asset2_col            = input.color(color.purple,    "Asset 2",              group = CS, inline = "C1")
+simple color  asset3_col            = input.color(color.green,  "Asset 3",              group = CS, inline = "C1")
+simple color  asset4_col            = input.color(color.red, "Asset 4",              group = CS, inline = "C2")
+simple color  asset5_col            = input.color(color.blue, "Asset 5",              group = CS, inline = "C2")
+simple color  asset6_col            = input.color(color.orange, "Asset 6",              group = CS, inline = "C2")
+simple color  usd_col               = input.color(color.white,  "USD",                  group = CS, inline = "C3")
+simple color  gold_col              = input.color(color.yellow,      "Gold",                 group = CS, inline = "C3")
+simple color  tab_lab_text_col      = input.color(color.white,  "Table & Lable Text",   group = CS, inline = "C3")
+
+// UNISTRAT - Gaussian VIDYA (Gaussian Filter)
+simple int    g_periode             = input.int(4,    "Length",           minval = 1, step = 1,   group = UG, display = display.none)
+simple float  g_sigma               = input.float(2.0, "Sigma",           minval = 0.1, step = 0.1, group = UG, display = display.none)
+
+// UNISTRAT - Gaussian VIDYA (VIDYA ATR)
+simple int    v_per                 = input.int(9,    "VIDYA Length",     group = UV, display = display.none)
+simple int    v_histPer             = input.int(30,   "SD Length",        group = UV, display = display.none)
+simple int    v_atr_length          = input.int(14,   "ATR Length",       minval = 1, step = 1,   group = UV, display = display.none)
+simple float  v_mult                = input.float(1.7, "ATR Mult",        minval = 0, step = 0.1,  group = UV, display = display.none)
+
+// UNISTRAT - DEMA ATR
+simple int    d_periodDema          = input.int(30,   "DEMA Period",      group = UD, display = display.none)
+simple int    d_periodAtr           = input.int(14,   "ATR Period",       group = UD, display = display.none)
+simple float  d_factorAtr           = input.float(1.0, "ATR Factor",      step = 0.01,             group = UD, display = display.none)
+
+// UNISTRAT - VIDYA Loop
+simple int    l_len_V               = input.int(2,    "VIDYA Length",     group = UL, display = display.none)
+simple int    l_len_VHist           = input.int(5,    "SD Length",        group = UL, display = display.none)
+simple int    l_start               = input.int(1,    "Loop Start",       group = UL, inline = "L1", display = display.none)
+simple int    l_end                 = input.int(60,   "Loop End",         group = UL, inline = "L1", display = display.none)
+simple int    l_long_t              = input.int(40,   "Long Threshold",   step = 1,   group = UL, inline = "L2", display = display.none)
+simple int    l_short_t             = input.int(8,    "Short Threshold",  step = 1,   group = UL, inline = "L2", display = display.none)
+
+// UNISTRAT - Median SD
+simple int    m_base_len            = input.int(24,   "Base Median Length",       group = UM, display = display.none)
+simple int    m_norm_len            = input.int(50,   "Normalized Median Length", group = UM, display = display.none)
+simple int    m_sd_len              = input.int(32,   "Norm. Median SD Length",   group = UM, display = display.none)
+simple float  m_upperSd             = input.float(0.98, "Upper Median SD",        step = 0.02,    group = UM, display = display.none)
+simple float  m_lowerSd             = input.float(1.02, "Lower Median SD",        step = 0.02,    group = UM, display = display.none)
+simple int    m_normSmooth          = input.int(1,    "Normalized Smooth",        group = UM, display = display.none)
+//}
+
+// ╔════════════════════════════╗
+// ║   TREND CLASSIFICATION     ║
+// ║   (UNISTRAT TPI)           ║
+// ╚════════════════════════════╝
+//{
+// Replaces the old single-indicator trend following classifiers with the UNISTRAT
+// Trend Probability Index. Four independent sub-models each return a vote in {-1, 0, +1}:
+//   1) Gaussian VIDYA          -> B1
+//   2) DEMA ATR                -> DemaAtrScore
+//   3) VIDYA For-Loop          -> QB2
+//   4) SD Median               -> sdMedianScore
+// The votes are averaged into tpiScore. A positive TPI means the (numerator) asset of the
+// evaluated pair is in a relative uptrend, i.e. it is outperforming the (denominator) asset.
+//
+// This function is defined after the INPUTS section so it can read the UNISTRAT settings
+// directly from global scope. The classification "src" is passed in as an argument so that,
+// when this function is called inside request.security(), it is evaluated in the context of
+// the requested (ratio) symbol - exactly how the original script handled its sources.
+// Core UNISTRAT TPI. `synthetic` must be true when `src` is a constructed series with no
+// real OHLC (e.g. the equity curve): in that case the ATR sub-models cannot use ta.atr()
+// (which reads the chart's high/low/close), so the true range collapses to the absolute
+// bar-to-bar change of src. For real symbols (the asset-ratio charts) pass synthetic=false
+// so ta.atr() uses the requested symbol's own OHLC, exactly as before.
+f_tpi(series float src, simple bool synthetic) =>
+
+    // ----- 1) Gaussian VIDYA -----
+    gaussian_smooth = f_gaussian_filter(src, g_periode, g_sigma)
+    k_g             = ta.stdev(gaussian_smooth, v_per) / ta.stdev(gaussian_smooth, v_histPer)
+    sc_g            = 2.0 / (v_per + 1)
+    var float VIDYA = 0.0
+    VIDYA           := nz(k_g * sc_g * gaussian_smooth + (1 - k_g * sc_g) * VIDYA[1], 0)
+    atr_g           = synthetic ? ta.rma(nz(math.abs(src - src[1])), v_atr_length) : ta.atr(v_atr_length)
+    long_g          = src > VIDYA + atr_g * v_mult
+    short_g         = src < VIDYA - atr_g * v_mult
+    var int B1      = 0
+    if long_g and not short_g
+        B1 := 1
+    if short_g
+        B1 := -1
+
+    // ----- 2) DEMA ATR -----
+    GDEMA               = ta.dema(src, d_periodDema)
+    atr_d               = synthetic ? ta.rma(nz(math.abs(src - src[1])), d_periodAtr) : ta.atr(d_periodAtr)
+    long_d              = src > GDEMA + atr_d * d_factorAtr
+    short_d             = src < GDEMA - atr_d * d_factorAtr
+    var int DemaAtrScore = 0
+    if long_d and not short_d
+        DemaAtrScore := 1
+    if short_d
+        DemaAtrScore := -1
+
+    // ----- 3) VIDYA For-Loop -----
+    SD_V             = ta.stdev(src, l_len_V) / ta.stdev(src, l_len_VHist)
+    sc_l             = 2.0 / (l_len_V + 1)
+    var float VIDYA2 = 0.0
+    VIDYA2           := nz(SD_V * sc_l * src + (1 - SD_V * sc_l) * VIDYA2[1], 0)
+    vidya_loop       = f_loop(l_start, l_end, VIDYA2)
+    long_l           = vidya_loop > l_long_t
+    short_l          = vidya_loop < l_short_t
+    var int QB2      = 0
+    if long_l and not short_l
+        QB2 := 1
+    if short_l
+        QB2 := -1
+
+    // ----- 4) SD Median -----
+    // UNISTRAT's median model is written against `close`; here it uses `src` so the
+    // whole TPI can be evaluated on ANY series - the ratio's price when classifying
+    // asset pairs (src resolves to the requested symbol's close by default, so this
+    // is unchanged for the default source) and the equity curve when the equity
+    // filter is enabled.
+    base_median         = ta.median(src, m_base_len)
+    base_medianSd       = ta.stdev(base_median, m_sd_len)
+    upperBasemedian     = (base_median + base_medianSd) * m_upperSd
+    lowerBasemedian     = (base_median - base_medianSd) * m_lowerSd
+    base_long           = src > upperBasemedian
+    base_short          = src < lowerBasemedian
+    normBasemedian      = ta.median(src, m_norm_len)
+    normMedian          = -1 * normBasemedian / src
+    normSd              = ta.stdev(normMedian, m_sd_len)
+    normLowerBound      = ta.ema(normMedian - normSd, m_normSmooth)
+    norm_long           = normLowerBound > -1
+    norm_short          = normMedian < -1
+    long_m              = base_long and norm_long
+    short_m             = base_short and norm_short
+    var int sdMedianScore = 0
+    if long_m and not short_m
+        sdMedianScore := 1
+    if short_m
+        sdMedianScore := -1
+
+    // ----- Combine into the TPI -----
+    // tpiScore  > 0  -> numerator asset wins (long)
+    // tpiScore  < 0  -> denominator asset wins (flat)
+    // tpiScore == 0  -> hold the previous signal. This mirrors how UNISTRAT was
+    //                   designed: it only flips the position when the score crosses
+    //                   zero (long on > 0, cash on < 0), leaving the position
+    //                   untouched while the score sits exactly at zero.
+    tpiScore    = math.avg(B1, DemaAtrScore, QB2, sdMedianScore)
+    var int sig = 0
+    if tpiScore > 0
+        sig := 1
+    if tpiScore < 0
+        sig := 0
+
+    [sig, f_oppose(sig)]
+
+// Thin wrapper used for the asset-pair classification (real symbols -> synthetic = false),
+// so all the request.security() call sites can keep calling f_trend(src) unchanged.
+f_trend(series float src) =>
+    f_tpi(src, false)
+
+// Non-repainting wrapper for HIGHER-TIMEFRAME requests. Returns the signal of the LAST
+// CLOSED higher-timeframe bar. Must be paired with lookahead = barmerge.lookahead_on in
+// request.security() - the standard non-repainting HTF pattern: the [1] offset means only
+// confirmed HTF bars are ever referenced, and lookahead_on aligns that confirmed value to
+// the chart bars where it was actually known. Result: historical and realtime bars see
+// EXACTLY the same series - no more weekly signals that appear mid-week and vanish.
+f_trend_htf(series float src) =>
+    [s, o] = f_tpi(src, false)
+    [s[1], o[1]]
+//}
+
+// ╔════════════════════════════╗
+// ║       TREND ANALYSIS       ║
+// ╚════════════════════════════╝
+//{
+
+// Asset 1 against all assets
+[c1_2, c2_1]        = request.security(str.tostring(ticker1 + "/" + ticker2), "", f_trend(unistrat_src))
+[c1_3, c3_1]        = request.security(str.tostring(ticker1 + "/" + ticker3), "", f_trend(unistrat_src))
+[c1_4, c4_1]        = request.security(str.tostring(ticker1 + "/" + ticker4), "", f_trend(unistrat_src))
+[c1_5, c5_1]        = request.security(str.tostring(ticker1 + "/" + ticker5), "", f_trend(unistrat_src))
+[c1_6, c6_1]        = request.security(str.tostring(ticker1 + "/" + ticker6), "", f_trend(unistrat_src))
+[c1_usd, cusd_1]    = request.security(ticker1, "", f_trend(unistrat_src))
+[c1_age, r1]        = request.security(ticker1, "", [f_age(), f_roc()])
+
+// Asset 2 against all remaining assets
+[c2_3, c3_2]        = request.security(str.tostring(ticker2 + "/" + ticker3), "", f_trend(unistrat_src))
+[c2_4, c4_2]        = request.security(str.tostring(ticker2 + "/" + ticker4), "", f_trend(unistrat_src))
+[c2_5, c5_2]        = request.security(str.tostring(ticker2 + "/" + ticker5), "", f_trend(unistrat_src))
+[c2_6, c6_2]        = request.security(str.tostring(ticker2 + "/" + ticker6), "", f_trend(unistrat_src))
+[c2_usd, cusd_2]    = request.security(ticker2, "", f_trend(unistrat_src))
+[c2_age, r2]        = request.security(ticker2, "", [f_age(), f_roc()])
+
+// Asset 3 against all remaining assets
+[c3_4, c4_3]        = request.security(str.tostring(ticker3 + "/" + ticker4), "", f_trend(unistrat_src))
+[c3_5, c5_3]        = request.security(str.tostring(ticker3 + "/" + ticker5), "", f_trend(unistrat_src))
+[c3_6, c6_3]        = request.security(str.tostring(ticker3 + "/" + ticker6), "", f_trend(unistrat_src))
+[c3_usd, cusd_3]    = request.security(ticker3, "", f_trend(unistrat_src))
+[c3_age, r3]        = request.security(ticker3, "", [f_age(), f_roc()])
+
+// Asset 4 against all remaining assets
+[c4_5, c5_4]        = request.security(str.tostring(ticker4 + "/" + ticker5), "", f_trend(unistrat_src))
+[c4_6, c6_4]        = request.security(str.tostring(ticker4 + "/" + ticker6), "", f_trend(unistrat_src))
+[c4_usd, cusd_4]    = request.security(ticker4, "", f_trend(unistrat_src))
+[c4_age, r4]        = request.security(ticker4, "", [f_age(), f_roc()])
+
+// Asset 5 against all remaining assets
+[c5_6, c6_5]        = request.security(str.tostring(ticker5 + "/" + ticker6), "", f_trend(unistrat_src))
+[c5_usd, cusd_5]    = request.security(ticker5, "", f_trend(unistrat_src))
+[c5_age, r5]        = request.security(ticker5, "", [f_age(), f_roc()])
+
+// Asset 6 against remaining asset (USD)
+[c6_usd, cusd_6]    = request.security(ticker6, "", f_trend(unistrat_src))
+[c6_age, r6]        = request.security(ticker6, "", [f_age(), f_roc()])
+
+// BTC market-regime filters: UNISTRAT trend of INDEX:BTCUSD on the chart timeframe and on a
+// custom timeframe. Each is 1 while BTC is in an uptrend, else 0 (used only if its toggle is on).
+// The custom-TF request uses the non-repainting pattern (confirmed HTF bars only) so live
+// signals match the backtest; the chart-TF request needs no such handling (same timeframe).
+[btc_long_chart, _btc_short_chart] = request.security("INDEX:BTCUSD", "",            f_trend(unistrat_src))
+[btc_long_tf,    _btc_short_tf]     = request.security("INDEX:BTCUSD", btc_filter_tf, f_trend_htf(unistrat_src), lookahead = barmerge.lookahead_on)
+
+// Combined BTC gate: true when every ENABLED BTC filter agrees BTC is in an uptrend.
+series bool btc_ok = (not use_btc_filter_chart or nz(btc_long_chart) > 0) and (not use_btc_filter_tf or nz(btc_long_tf) > 0)
+
+// Trend-managed gold for the cash sleeve: UNISTRAT trend of gold on the selected timeframe
+// (gold_long_w = 1 while gold's trend is long, else 0). Non-repainting pattern: the signal
+// comes from the last CLOSED gold_tf bar, so live signals match the backtest.
+[gold_long_w, _gold_short_w] = request.security(gold_ticker, gold_tf, f_trend_htf(unistrat_src), lookahead = barmerge.lookahead_on)
+// Gold's return is computed from the requested close ON CHART BARS (not inside gold's own
+// context). When gold's market is closed (e.g. weekends on traditional feeds), the requested
+// close is simply unchanged, so the return is exactly 0 - previously, computing f_roc() inside
+// gold's context made request.security() re-serve gold's LAST return on every closed-market
+// chart bar, compounding the same (usually positive, since we only hold gold when its trend is
+// long) return several extra times per weekend and inflating backtests on traditional feeds.
+series float gold_close     = request.security(gold_ticker, "", close)
+series float r_gold         = nz(gold_close / gold_close[1] - 1, 0)
+
+// Per-bar return of the cash sleeve: gold's return while enabled AND gold's weekly trend is
+// long (as of the prior bar - no look-ahead), otherwise 0 (plain USD).
+series float cash_ret       = (use_gold_cash and nz(gold_long_w[1]) > 0) ? r_gold : 0.0
+
+
+// Which asset slots are included (Assets 1..num_assets). USD is always available.
+bool inc1 = num_assets >= 1
+bool inc2 = num_assets >= 2
+bool inc3 = num_assets >= 3
+bool inc4 = num_assets >= 4
+bool inc5 = num_assets >= 5
+bool inc6 = num_assets >= 6
+
+// Calculation of Final Score for each asset (number of assets it is currently outperforming).
+// Only comparisons against INCLUDED assets (plus USD) are counted; an excluded slot gets a
+// score of -1 so it can never be selected as best/second/third (real scores are always >= 0).
+series int a1_score         = inc1 ? ((inc2 ? c1_2 : 0) + (inc3 ? c1_3 : 0) + (inc4 ? c1_4 : 0) + (inc5 ? c1_5 : 0) + (inc6 ? c1_6 : 0) + c1_usd) : -1
+series int a2_score         = inc2 ? ((inc1 ? c2_1 : 0) + (inc3 ? c2_3 : 0) + (inc4 ? c2_4 : 0) + (inc5 ? c2_5 : 0) + (inc6 ? c2_6 : 0) + c2_usd) : -1
+series int a3_score         = inc3 ? ((inc1 ? c3_1 : 0) + (inc2 ? c3_2 : 0) + (inc4 ? c3_4 : 0) + (inc5 ? c3_5 : 0) + (inc6 ? c3_6 : 0) + c3_usd) : -1
+series int a4_score         = inc4 ? ((inc1 ? c4_1 : 0) + (inc2 ? c4_2 : 0) + (inc3 ? c4_3 : 0) + (inc5 ? c4_5 : 0) + (inc6 ? c4_6 : 0) + c4_usd) : -1
+series int a5_score         = inc5 ? ((inc1 ? c5_1 : 0) + (inc2 ? c5_2 : 0) + (inc3 ? c5_3 : 0) + (inc4 ? c5_4 : 0) + (inc6 ? c5_6 : 0) + c5_usd) : -1
+series int a6_score         = inc6 ? ((inc1 ? c6_1 : 0) + (inc2 ? c6_2 : 0) + (inc3 ? c6_3 : 0) + (inc4 ? c6_4 : 0) + (inc5 ? c6_5 : 0) + c6_usd) : -1
+series int usd_score        = (inc1 ? cusd_1 : 0) + (inc2 ? cusd_2 : 0) + (inc3 ? cusd_3 : 0) + (inc4 ? cusd_4 : 0) + (inc5 ? cusd_5 : 0) + (inc6 ? cusd_6 : 0)
+
+// Pairwise classification matrix for ranking tie-breaks: pw.get(i, j) = 1 if entity i is
+// currently beating entity j in their direct ratio (index 6 = USD). Uses the SAME current-bar
+// values as the scores above, so ranking and tie-breaks are always consistent.
+matrix<int> pw = matrix.new<int>(7, 7, 0)
+matrix.set(pw, 0, 1, c1_2),   matrix.set(pw, 0, 2, c1_3),   matrix.set(pw, 0, 3, c1_4),   matrix.set(pw, 0, 4, c1_5),   matrix.set(pw, 0, 5, c1_6),   matrix.set(pw, 0, 6, c1_usd)
+matrix.set(pw, 1, 0, c2_1),   matrix.set(pw, 1, 2, c2_3),   matrix.set(pw, 1, 3, c2_4),   matrix.set(pw, 1, 4, c2_5),   matrix.set(pw, 1, 5, c2_6),   matrix.set(pw, 1, 6, c2_usd)
+matrix.set(pw, 2, 0, c3_1),   matrix.set(pw, 2, 1, c3_2),   matrix.set(pw, 2, 3, c3_4),   matrix.set(pw, 2, 4, c3_5),   matrix.set(pw, 2, 5, c3_6),   matrix.set(pw, 2, 6, c3_usd)
+matrix.set(pw, 3, 0, c4_1),   matrix.set(pw, 3, 1, c4_2),   matrix.set(pw, 3, 2, c4_3),   matrix.set(pw, 3, 4, c4_5),   matrix.set(pw, 3, 5, c4_6),   matrix.set(pw, 3, 6, c4_usd)
+matrix.set(pw, 4, 0, c5_1),   matrix.set(pw, 4, 1, c5_2),   matrix.set(pw, 4, 2, c5_3),   matrix.set(pw, 4, 3, c5_4),   matrix.set(pw, 4, 5, c5_6),   matrix.set(pw, 4, 6, c5_usd)
+matrix.set(pw, 5, 0, c6_1),   matrix.set(pw, 5, 1, c6_2),   matrix.set(pw, 5, 2, c6_3),   matrix.set(pw, 5, 3, c6_4),   matrix.set(pw, 5, 4, c6_5),   matrix.set(pw, 5, 6, c6_usd)
+matrix.set(pw, 6, 0, cusd_1), matrix.set(pw, 6, 1, cusd_2), matrix.set(pw, 6, 2, cusd_3), matrix.set(pw, 6, 3, cusd_4), matrix.set(pw, 6, 4, cusd_5), matrix.set(pw, 6, 5, cusd_6)
+
+// Determining the strongest, second- and third-strongest assets (ties broken by the pairwise ratio)
+[best_asset, second_asset, third_asset] = f_TopThreeAssets(ticker1, a1_score, ticker2, a2_score, ticker3, a3_score, ticker4, a4_score, ticker5, a5_score, ticker6, a6_score, "USD", usd_score, pw)
+
+// Allocation aggressiveness (see "Allocation Mode" input)
+simple bool   aggressive    = alloc_mode == "80% Strongest + 20% Second"
+simple bool   triple        = alloc_mode == "60% / 30% / 10% Top Three"
+simple float  w_primary     = triple ? 0.6 : aggressive ? 0.8 : 1.0
+simple float  w_secondary   = triple ? 0.3 : aggressive ? 0.2 : 0.0
+simple float  w_tertiary    = triple ? 0.1 : 0.0
+
+// Calculation of equity curves and maximum drawdown for Strategy and Buy and Hold for each asset
+bool backtest               = (not inc1 or c1_age > warmup_bars) and (not inc2 or c2_age > warmup_bars) and (not inc3 or c3_age > warmup_bars) and (not inc4 or c4_age > warmup_bars) and (not inc5 or c5_age > warmup_bars) and (not inc6 or c6_age > warmup_bars) and (not use_custom_startdate or time > custom_startdate)
+
+// Gold-free "signal" equity: identical strategy but the cash sleeve always earns 0 (plain
+// USD). Used ONLY as the source for the equity-filter TPI below, so the filter trend-manages
+// the normal strategy and is never influenced by the gold sleeve's returns.
+[eq_base, _dd_base]          = f_equity(ticker1, ticker2, ticker3, ticker4, ticker5, ticker6, best_asset, second_asset, third_asset, r1, r2, r3, r4, r5, r6, backtest, w_primary, w_secondary, w_tertiary, btc_ok, 0.0)
+
+// Gold-included "money" equity: the actual portfolio, where cash periods (USD strongest or a
+// BTC filter blocking) hold trend-managed gold when it is long. Identical to eq_base when the
+// gold option is off (cash_ret is then always 0).
+[eq, dd_eq]                 = f_equity(ticker1, ticker2, ticker3, ticker4, ticker5, ticker6, best_asset, second_asset, third_asset, r1, r2, r3, r4, r5, r6, backtest, w_primary, w_secondary, w_tertiary, btc_ok, cash_ret)
+[bah1, dd1]                 = f_buy_and_hold(r1, backtest)
+[bah2, dd2]                 = f_buy_and_hold(r2, backtest)
+[bah3, dd3]                 = f_buy_and_hold(r3, backtest)
+[bah4, dd4]                 = f_buy_and_hold(r4, backtest)
+[bah5, dd5]                 = f_buy_and_hold(r5, backtest)
+[bah6, dd6]                 = f_buy_and_hold(r6, backtest)
+
+// Equity filter: run the UNISTRAT TPI on the GOLD-FREE equity curve (eq_base), then build a
+// "filtered" equity from the gold-included money curve: while the (gold-free) equity trend is
+// long it compounds eq's return; while it is out, the book sits in the cash sleeve (gold when
+// long per its own trend management, else USD).
+// synthetic = true because the equity curve has no real OHLC for ta.atr() to use.
+[eq_sig, _eq_sig_oppose]     = f_tpi(eq_base, true)      // eq_sig = 1 when the gold-free equity is in an uptrend, else 0
+[eq_filt, dd_filt]          = f_filtered_equity(eq, eq_sig, backtest, cash_ret)
+
+// Which equity does the strategy actually follow?
+float followed_eq           = use_equity_filter ? eq_filt : eq
+float dd_followed           = use_equity_filter ? dd_filt : dd_eq
+
+// Effective position we are actually holding this bar. With the filter off this is just
+// the strongest asset (the primary leg in blended modes); with the filter on we drop to
+// cash ("USD") whenever the equity is not in a positive trend. The BTC regime filters, when
+// enabled, also force cash whenever BTC is not in an uptrend. Drives the bar color.
+series bool invested        = (not use_equity_filter or eq_sig > 0) and btc_ok
+series string active_asset   = invested ? best_asset : "USD"
+
+// Human-readable description of the current allocation (for the table and the alert).
+// While in cash, the label shows GOLD when the trend-managed gold sleeve is active
+// (toggle on + gold's 1W UNISTRAT trend long), otherwise USD.
+series bool   gold_active   = use_gold_cash and nz(gold_long_w) > 0
+series string cash_label    = gold_active ? "GOLD" : "USD"
+// True when the book is actually sitting in the gold sleeve this bar (in cash + gold trend long)
+series bool   holding_gold  = (not invested or best_asset == "USD") and gold_active
+series string alloc_label   = (not invested or best_asset == "USD") ? cash_label :
+     triple ? str.tostring(int(math.round(w_primary * 100))) + "% " + f_remove_exchange_name(best_asset) + " / " + str.tostring(int(math.round(w_secondary * 100))) + "% " + f_remove_exchange_name(second_asset) + " / " + str.tostring(int(math.round(w_tertiary * 100))) + "% " + f_remove_exchange_name(third_asset) :
+     aggressive ? str.tostring(int(math.round(w_primary * 100))) + "% " + f_remove_exchange_name(best_asset) + " / " + str.tostring(int(math.round(w_secondary * 100))) + "% " + f_remove_exchange_name(second_asset) :
+     f_remove_exchange_name(best_asset)
+
+// Calculating of Performance metrics of Strategy and Buy and Hold for each asset (returned in an array)
+since                       = f_since(backtest)
+
+float[] a_strategy          = f_PerformanceMetrics(followed_eq, since, backtest, dd_followed)
+float[] a1                  = f_PerformanceMetrics(bah1, since, backtest, dd1)
+float[] a2                  = f_PerformanceMetrics(bah2, since, backtest, dd2)
+float[] a3                  = f_PerformanceMetrics(bah3, since, backtest, dd3)
+float[] a4                  = f_PerformanceMetrics(bah4, since, backtest, dd4)
+float[] a5                  = f_PerformanceMetrics(bah5, since, backtest, dd5)
+float[] a6                  = f_PerformanceMetrics(bah6, since, backtest, dd6)
+//}
+
+// ╔════════════════════════════╗
+// ║      PLOTS AND TABLES      ║
+// ╚════════════════════════════╝
+//{
+
+// Place all colors into an array for table and functions
+color[] colors              = array.new_color(8)
+
+array.set(colors, 0, asset1_col),   array.set(colors, 1, asset2_col)
+array.set(colors, 2, asset3_col),   array.set(colors, 3, asset4_col)
+array.set(colors, 4, asset5_col),   array.set(colors, 5, asset6_col)
+array.set(colors, 6, usd_col),      array.set(colors, 7, tab_lab_text_col)
+
+// Plotting equity curves
+// The followed curve is drawn in its position colors; the other is dimmed (filter on) or
+// hidden (filter off). Color priority for the followed curve (prior-bar values, matching the
+// equity's position timing): GOLD while the cash sleeve holds trend-managed gold, GRAY when a
+// BTC filter has forced idle cash, otherwise the active asset's color (USD color for plain cash).
+color eq_color = holding_gold[1] ? gold_col : not btc_ok[1] ? color.gray : f_best_asset_col(ticker1, ticker2, ticker3, ticker4, ticker5, ticker6, active_asset, backtest, colors)
+plot(eq,      "Unfiltered Equity", color = use_equity_filter ? color.new(color.gray, 60) : eq_color, linewidth = 3)
+plot(eq_filt, "Filtered Equity",   color = use_equity_filter ? eq_color : color.new(color.white, 100), linewidth = 3)
+plot(bah1, "Buy and Hold Asset1", color = show_asset_equities and backtest and inc1 ? color.new(asset1_col, 30) : color.new(color.white, 100))
+plot(bah2, "Buy and Hold Asset2", color = show_asset_equities and backtest and inc2 ? color.new(asset2_col, 30) : color.new(color.white, 100))
+plot(bah3, "Buy and Hold Asset3", color = show_asset_equities and backtest and inc3 ? color.new(asset3_col, 30) : color.new(color.white, 100))
+plot(bah4, "Buy and Hold Asset4", color = show_asset_equities and backtest and inc4 ? color.new(asset4_col, 30) : color.new(color.white, 100))
+plot(bah5, "Buy and Hold Asset5", color = show_asset_equities and backtest and inc5 ? color.new(asset5_col, 30) : color.new(color.white, 100))
+plot(bah6, "Buy and Hold Asset6", color = show_asset_equities and backtest and inc6 ? color.new(asset6_col, 30) : color.new(color.white, 100))
+
+// Labels
+if backtest and barstate.islast
+    label.new(bar_index + 5, followed_eq, use_equity_filter ? "Strategy (Filtered)" : "Strategy", color = color.gray, textcolor = tab_lab_text_col, style = label.style_label_left)
+    if use_equity_filter
+        label.new(bar_index + 5, eq, "Unfiltered", color = color.new(color.gray, 50), textcolor = tab_lab_text_col, style = label.style_label_left)
+    if show_asset_equities
+        if inc1
+            label.new(bar_index + 5, bah1, str.tostring(f_remove_exchange_name(ticker1)), color = asset1_col,     textcolor = tab_lab_text_col, style = label.style_label_left)
+        if inc2
+            label.new(bar_index + 5, bah2, str.tostring(f_remove_exchange_name(ticker2)), color = asset2_col,     textcolor = tab_lab_text_col, style = label.style_label_left)
+        if inc3
+            label.new(bar_index + 5, bah3, str.tostring(f_remove_exchange_name(ticker3)), color = asset3_col,     textcolor = tab_lab_text_col, style = label.style_label_left)
+        if inc4
+            label.new(bar_index + 5, bah4, str.tostring(f_remove_exchange_name(ticker4)), color = asset4_col,     textcolor = tab_lab_text_col, style = label.style_label_left)
+        if inc5
+            label.new(bar_index + 5, bah5, str.tostring(f_remove_exchange_name(ticker5)), color = asset5_col,     textcolor = tab_lab_text_col, style = label.style_label_left)
+        if inc6
+            label.new(bar_index + 5, bah6, str.tostring(f_remove_exchange_name(ticker6)), color = asset6_col,     textcolor = tab_lab_text_col, style = label.style_label_left)
+
+// Barcolor
+barcolor(f_best_asset_col(ticker1, ticker2, ticker3, ticker4, ticker5, ticker6, active_asset, backtest, colors))
+
+// Tables
+table t = table.new(position.bottom_right,  num_assets + 3, num_assets + 2, bgcolor = color.new(color.gray, 80), frame_color = color.white, frame_width = 2)
+table b = table.new(position.bottom_center, 1, 2, bgcolor = color.new(color.gray, 80), frame_color = color.white, frame_width = 2)
+
+if barstate.islast
+
+    // Table with Trend Scores (Asset Trend Matrix) //
+    if show_trend_matrix
+        int shown    = num_assets + 1   // included assets + USD
+        int scoreCol = num_assets + 2   // index of the rightmost (Score) column
+
+        // Pairwise classification matrix: cm.get(i, j) = 1 if entity i beats entity j (index 6 = USD)
+        matrix<int> cm = matrix.new<int>(7, 7, 0)
+        matrix.set(cm, 0, 1, c1_2[1]),   matrix.set(cm, 0, 2, c1_3[1]),   matrix.set(cm, 0, 3, c1_4[1]),   matrix.set(cm, 0, 4, c1_5[1]),   matrix.set(cm, 0, 5, c1_6[1]),   matrix.set(cm, 0, 6, c1_usd[1])
+        matrix.set(cm, 1, 0, c2_1[1]),   matrix.set(cm, 1, 2, c2_3[1]),   matrix.set(cm, 1, 3, c2_4[1]),   matrix.set(cm, 1, 4, c2_5[1]),   matrix.set(cm, 1, 5, c2_6[1]),   matrix.set(cm, 1, 6, c2_usd[1])
+        matrix.set(cm, 2, 0, c3_1[1]),   matrix.set(cm, 2, 1, c3_2[1]),   matrix.set(cm, 2, 3, c3_4[1]),   matrix.set(cm, 2, 4, c3_5[1]),   matrix.set(cm, 2, 5, c3_6[1]),   matrix.set(cm, 2, 6, c3_usd[1])
+        matrix.set(cm, 3, 0, c4_1[1]),   matrix.set(cm, 3, 1, c4_2[1]),   matrix.set(cm, 3, 2, c4_3[1]),   matrix.set(cm, 3, 4, c4_5[1]),   matrix.set(cm, 3, 5, c4_6[1]),   matrix.set(cm, 3, 6, c4_usd[1])
+        matrix.set(cm, 4, 0, c5_1[1]),   matrix.set(cm, 4, 1, c5_2[1]),   matrix.set(cm, 4, 2, c5_3[1]),   matrix.set(cm, 4, 3, c5_4[1]),   matrix.set(cm, 4, 5, c5_6[1]),   matrix.set(cm, 4, 6, c5_usd[1])
+        matrix.set(cm, 5, 0, c6_1[1]),   matrix.set(cm, 5, 1, c6_2[1]),   matrix.set(cm, 5, 2, c6_3[1]),   matrix.set(cm, 5, 3, c6_4[1]),   matrix.set(cm, 5, 4, c6_5[1]),   matrix.set(cm, 5, 6, c6_usd[1])
+        matrix.set(cm, 6, 0, cusd_1[1]), matrix.set(cm, 6, 1, cusd_2[1]), matrix.set(cm, 6, 2, cusd_3[1]), matrix.set(cm, 6, 3, cusd_4[1]), matrix.set(cm, 6, 4, cusd_5[1]), matrix.set(cm, 6, 5, cusd_6[1])
+
+        // Display names, colors and scores per entity index (0-5 = assets, 6 = USD)
+        array<string> names  = array.from(f_remove_exchange_name(ticker1), f_remove_exchange_name(ticker2), f_remove_exchange_name(ticker3), f_remove_exchange_name(ticker4), f_remove_exchange_name(ticker5), f_remove_exchange_name(ticker6), "USD")
+        array<int>    scores = array.from(a1_score[1], a2_score[1], a3_score[1], a4_score[1], a5_score[1], a6_score[1], usd_score[1])
+
+        // Corner + Score header
+        t.cell(0, 0, "")
+        t.cell(scoreCol, 0, "Score", text_color = tab_lab_text_col)
+
+        // Build the matrix, looping over shown entities (Assets 1..N, then USD)
+        for pr = 0 to shown - 1
+            idxR = pr < num_assets ? pr : 6
+            t.cell(0, pr + 1, array.get(names, idxR), text_color = array.get(colors, idxR))                 // left header (colored by asset)
+            t.cell(pr + 1, 0, array.get(names, idxR), text_color = tab_lab_text_col)                        // top header
+            t.cell(scoreCol, pr + 1, str.tostring(array.get(scores, idxR)), text_color = tab_lab_text_col)  // score
+            for pc = 0 to shown - 1
+                idxC = pc < num_assets ? pc : 6
+                if pr == pc
+                    t.cell(pc + 1, pr + 1, "", bgcolor = color.new(color.gray, 50))
+                else
+                    cval = matrix.get(cm, idxR, idxC)
+                    t.cell(pc + 1, pr + 1, str.tostring(cval), text_color = f_trend_col(cval))
+
+
+    // Table B //
+    b.cell(0, 0, "Current Position:",            text_color = tab_lab_text_col)
+    b.cell(0, 1, text = alloc_label[1],          text_color = tab_lab_text_col)
+
+
+    // Performance Metrics Table //
+    if plot_metric_table
+        f_PerfMetricTable(num_assets, ticker1, ticker2, ticker3, ticker4, ticker5, ticker6, a_strategy, a1, a2, a3, a4, a5, a6, colors)
+//}
+
+// ╔════════════════════════════╗
+// ║           ALETRS           ║
+// ╚════════════════════════════╝
+//{
+bool alloc_changed = not (alloc_label[2] == alloc_label[1]) // Using indexes ensures candle close confirmation
+
+// Static alertcondition (for UI-created alerts). IMPORTANT if you use this one: configure the
+// alert as "Once Per Bar" (NOT "Once Per Bar Close") - the condition is true for the WHOLE bar
+// during which the new position should already be held, so firing at that bar's close would
+// notify you a full bar late versus the backtest's assumed entry.
+alertcondition(alloc_changed, "New Optimal Asset", message = "A new optimal allocation has been detected. Check chart for details")
+
+// Dynamic alert (preferred for live use): fires once at the FIRST tick of the bar on which the
+// new allocation takes effect - the same timing the equity assumes - and includes the actual
+// new position in the message. Create the alert with "Any alert() function call".
+if alloc_changed and backtest
+    alert("RSPS allocation changed -> " + alloc_label[1], alert.freq_once_per_bar)
+//}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WEEKLY EQUITY EXPORT (OHLC)  ->  Pine Logs panel   (works on the 12h chart)
+//  One "YYYY-MM-DD <tab> open <tab> high <tab> low <tab> close" per week-end,
+//  oldest first, plus the current (partial) week on the latest bar.
+//  Value = followed equity (total portfolio value, incl. cash sleeve).
+//    open  = equity at the FIRST chart bar of the week
+//    high  = highest equity recorded during the week
+//    low   = lowest  equity recorded during the week
+//    close = equity at the LAST chart bar of the week
+//  Week-end = the last 12h candle of each week (its close = end of the last day).
+//  Long histories are split across a few log messages so nothing exceeds Pine's
+//  log-length limit; each message holds whole lines. Paste them ALL into a sheet
+//  and sort by the date column - the order across messages doesn't matter.
+// ════════════════════════════════════════════════════════════════════════════
+bool   do_export  = input.bool(false, "Export Weekly Equity to Log", group = "Weekly Equity Export")
+float  export_val = followed_eq * 10000.0          // scale is arbitrary; returns are scale-free
+
+var string buf    = ""
+var float  wk_o   = na                              // running week's open
+var float  wk_h   = na                              // running week's high
+var float  wk_l   = na                              // running week's low
+
+weekStart        = time("1W")                       // start-of-week stamp; timeframe-independent
+bool week_rolled = not na(weekStart[1]) and weekStart != weekStart[1]
+
+// First bar of a new week => the PREVIOUS bar was the prior week's last 12h candle.
+// The accumulators still hold the COMPLETED week's O/H/L here (they are reset below),
+// and export_val[1] is that week's closing equity.
+// Flush the buffer first if adding this line would exceed the safe message length.
+if do_export and week_rolled and backtest[1] and not na(wk_o)
+    row = str.format_time(time[1], "yyyy-MM-dd", syminfo.timezone) + "\t" + str.tostring(wk_o, "#.##") + "\t" + str.tostring(wk_h, "#.##") + "\t" + str.tostring(wk_l, "#.##") + "\t" + str.tostring(export_val[1], "#.##") + "\n"
+    if str.length(buf) + str.length(row) > 3800
+        log.info(buf)
+        buf := ""
+    buf := buf + row
+
+// Accumulate the running week's O/H/L from the per-bar equity. A new week (or the first
+// backtested bar) starts fresh from this bar's value; within a week only the extremes move.
+if backtest
+    if week_rolled or na(wk_o)
+        wk_o := export_val
+        wk_h := export_val
+        wk_l := export_val
+    else
+        wk_h := math.max(wk_h, export_val)
+        wk_l := math.min(wk_l, export_val)
+
+// Final bar: append the current (possibly partial) week, then flush whatever remains.
+if do_export and barstate.islast and backtest and not na(wk_o)
+    last = str.format_time(time, "yyyy-MM-dd", syminfo.timezone) + "\t" + str.tostring(wk_o, "#.##") + "\t" + str.tostring(wk_h, "#.##") + "\t" + str.tostring(wk_l, "#.##") + "\t" + str.tostring(export_val, "#.##")
+    if str.length(buf) + str.length(last) > 3800
+        log.info(buf)
+        buf := ""
+    buf := buf + last
+    log.info(buf)

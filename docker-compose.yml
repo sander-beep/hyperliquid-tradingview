@@ -1,0 +1,46 @@
+services:
+  app:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/srv/data
+    expose:
+      - "8000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      # Any HTTP response (200 or 503) means the process is alive; only a
+      # connection failure marks the container unhealthy.
+      test: ["CMD", "python", "-c", "import urllib.request,urllib.error\ntry: urllib.request.urlopen('http://localhost:8000/healthz', timeout=5)\nexcept urllib.error.HTTPError: pass"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2
+    restart: always
+    ports:
+      - "443:443"
+      - "80:80"
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ACME_EMAIL=${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:

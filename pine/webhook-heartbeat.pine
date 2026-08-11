@@ -1,0 +1,66 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  WEBHOOK HEARTBEAT — final version of SPECS.md §4
+//
+//  HOW TO INSTALL (two small edits to the RSPS indicator):
+//
+//  1. Add this input near the other inputs (e.g. end of the INPUTS section):
+//
+//       simple string WEBHOOK_TOKEN = input.string("", "Webhook Token", group = "Webhook", tooltip = "Shared secret carried in every webhook payload. Must equal WEBHOOK_TOKEN in the bot's .env.")
+//
+//  2. In the ALERTS section (at the bottom of the script), DELETE the old
+//     dynamic alert:
+//
+//       if alloc_changed and backtest
+//           alert("RSPS allocation changed -> " + alloc_label[1], alert.freq_once_per_bar)
+//
+//     and paste the block below in its place. (Keep `alloc_changed` and the
+//     static alertcondition — they are untouched.)
+//
+//  THEN, ON TRADINGVIEW (one alert only):
+//    • Chart: the RSPS indicator on the 12h chart you backtested.
+//    • Create Alert → Condition: RSPS → "Any alert() function call".
+//    • Message: {{message}}     (nothing else)
+//    • Webhook URL: https://<your-domain>/webhook/<WEBHOOK_PATH_SECRET>
+//    • Expiration: max. Then send /armed to the Telegram bot.
+//
+//  TIMING: identical to the original dynamic alert. It fires once at the FIRST
+//  tick of every 12h bar and, like the original (`alloc_label[1]`), describes
+//  the allocation for the bar now underway using [1]-indexed variables — the
+//  same indexing f_equity uses — so live behavior matches the backtest. It just
+//  ALSO fires when nothing changed (the heartbeat the bot's watchdog relies on).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// One JSON leg: {"sym":"SOLUSD","w":0.8}
+f_leg(string sym, float w) =>
+    "{\"sym\":\"" + sym + "\",\"w\":" + str.tostring(w) + "}"
+
+// The cash sleeve's tradable symbol for the bar underway. In f_equity a "USD"
+// leg earns cash_ret, which is trend-managed gold's return while gold_active —
+// so the payload must say GOLD whenever the backtest math holds gold.
+string hb_cash_sym = gold_active[1] ? "GOLD" : "USD"
+
+// Full target allocation for the bar now underway ([1]-indexed, like alloc_label[1]).
+string hb_targets =
+     (not invested[1] or best_asset[1] == "USD") ?
+         f_leg(hb_cash_sym, 1.0) :
+     triple ?
+         f_leg(f_remove_exchange_name(best_asset[1]) == "USD" ? hb_cash_sym : f_remove_exchange_name(best_asset[1]), w_primary) + "," +
+         f_leg(f_remove_exchange_name(second_asset[1]) == "USD" ? hb_cash_sym : f_remove_exchange_name(second_asset[1]), w_secondary) + "," +
+         f_leg(f_remove_exchange_name(third_asset[1]) == "USD" ? hb_cash_sym : f_remove_exchange_name(third_asset[1]), w_tertiary) :
+     aggressive ?
+         f_leg(f_remove_exchange_name(best_asset[1]), w_primary) + "," +
+         f_leg(f_remove_exchange_name(second_asset[1]) == "USD" ? hb_cash_sym : f_remove_exchange_name(second_asset[1]), w_secondary) :
+         f_leg(f_remove_exchange_name(best_asset[1]), 1.0)
+
+string hb_payload =
+     "{\"v\":1" +
+     ",\"strategy\":\"RSPS-1\"" +
+     ",\"token\":\"" + WEBHOOK_TOKEN + "\"" +
+     ",\"seq\":" + str.tostring(time) +
+     ",\"bar_time\":\"" + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + "\"" +
+     ",\"changed\":" + (alloc_changed ? "true" : "false") +
+     ",\"targets\":[" + hb_targets + "]}"
+
+// Fire once at the first tick of every bar (the heartbeat).
+if backtest
+    alert(hb_payload, alert.freq_once_per_bar)
