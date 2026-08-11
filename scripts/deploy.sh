@@ -9,6 +9,12 @@ if [ ! -f .env ]; then
 fi
 
 git pull --ff-only || echo "(not a git checkout or no upstream — deploying local tree)"
+
+# The app container runs as the unprivileged 'bot' user (uid 1000); the
+# bind-mounted data dir must be writable by it or SQLite can't create the DB.
+mkdir -p data
+chown -R 1000:1000 data
+
 docker compose up -d --build
 docker compose ps
 echo "Deployed. Tail logs with: docker compose logs -f app"
