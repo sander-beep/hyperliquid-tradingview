@@ -61,6 +61,7 @@ class HLClient:
         self.exchange = Exchange(wallet, base_url, account_address=cfg.hl_account_address)
         self.address = cfg.hl_account_address
         self.sz_decimals: dict[str, int] = {}
+        self.missing_coins: list[str] = []
         self.last_ok: float | None = None  # monotonic ts of last successful API call
 
     # ---- resilient read wrapper -------------------------------------------
@@ -116,13 +117,28 @@ class HLClient:
         meta = await self._read("meta", self.info.meta)
         for asset in meta["universe"]:
             self.sz_decimals[asset["name"]] = int(asset["szDecimals"])
-        missing = [c for c in self.cfg.universe if c not in self.sz_decimals]
-        if missing:
-            raise RuntimeError(f"coins missing from Hyperliquid meta: {missing}")
+        # Coins in our universe that this network doesn't list. Expected on
+        # testnet (e.g. XRP has no testnet perp); alarming on mainnet (delisting
+        # or config typo). Either way the bot runs: legs for a missing coin are
+        # skipped by the planner ("no mark price") and reported.
+        self.missing_coins = sorted(c for c in self.cfg.universe if c not in self.sz_decimals)
+        if self.missing_coins:
+            msg = (
+                f"Coins not listed on Hyperliquid {'testnet' if self.cfg.hl_testnet else 'MAINNET'}: "
+                f"{', '.join(self.missing_coins)}. Target legs for them will be "
+                "skipped (their weight stays in cash)."
+            )
+            if self.cfg.hl_testnet:
+                logger.warning(msg)
+                await self.notifier.warn(msg)
+            else:
+                await self.notifier.critical("meta_missing", msg)
         if self.cfg.dry_run:
             logger.info("dry-run: skipping leverage setup")
             return
         for coin in sorted(self.cfg.universe):
+            if coin in self.missing_coins:
+                continue
             try:
                 await self._write(f"update_leverage({coin})", self.exchange.update_leverage, 1, coin, True)
             except HLError as e:
